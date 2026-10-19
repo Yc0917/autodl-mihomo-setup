@@ -1,43 +1,68 @@
-# AutoDL Mihomo 代理自动启动配置
+# AutoDL Mihomo：订阅更新、固定节点与容器自启动
 
-这份文档记录了如何在 AutoDL 实例上配置 Mihomo，让代理服务随实例启动后自动运行。配置完成后，可以通过代理访问外网服务，方便使用 Codex 辅助阅读和修改代码、编写实验脚本以及管理实验。
-将md丢给codex,让他配置即可。
+适用于 AutoDL Linux 容器的 Mihomo 独立代理部署说明。**2026-10-18 已在实际 AutoDL 容器停止并重启后验证启动钩子生效**。
 
-## 背景
+## 本次已验证的配置
 
-远程 GPU 实例通常不会自动使用本地电脑上的代理。每次启动实例后再手动安装、启动和配置代理，操作繁琐，也不方便从手机启动 AutoDL 后继续使用 Codex。
+| 项目 | 配置 |
+| --- | --- |
+| Mihomo | v1.19.32，`/usr/local/bin/mihomo` |
+| 配置 | `/etc/mihomo/config.yaml` |
+| 代理 | `127.0.0.1:7890`（mixed-port） |
+| 控制 API | `127.0.0.1:9090`（仅本机） |
+| 策略组 | `Flybit`（大小写敏感） |
+| 固定默认节点 | `🇸🇬 新加坡 \| 03` |
+| 选择恢复 | `profile.store-selected: false` |
+| AutoDL 启动入口 | `/etc/autodl.sh` → `/root/start_mihomo.sh` |
 
-我参考了这篇 [AutoDL / SeetaCloud 上使用 Codex 的教程](https://openeuler.csdn.net/6a2a6e27662f9a54cb7d15e5.html)，并整理了适用于当前 AutoDL 环境的 Mihomo 配置方法。
+旧版文档的 `FlyBit`、新加坡 13、`store-selected: true` 与 `/etc/profile.d` 开机钩子是**历史配置**，不再作为当前推荐方案。
 
-> 参考文章使用 SSH 反向隧道，将 Windows 本机代理转发到服务器；本仓库的教程则是在 AutoDL 实例上配置 Mihomo，并设置自动启动。两种方法都能为服务器提供代理，但配置方式不同。
+## 已安装 Mihomo：快速配置
 
-## 配置内容
+先阅读 [完整教程](autodl_mihomo_setup.md)，然后将仓库的启动脚本安装到 AutoDL：
 
-完整步骤请查看 [`autodl_mihomo_setup.md`](autodl_mihomo_setup.md)。文档涵盖：
+```bash
+install -m 755 scripts/start_mihomo.sh /root/start_mihomo.sh
+```
 
-- 检查 AutoDL 环境并安装 Mihomo
-- 配置订阅和代理节点
-- 下载并配置 `Country.mmdb`
-- 选择并持久化代理节点
-- 设置终端代理环境变量
-- 配置实例启动时自动运行 Mihomo
-- 验证代理状态与网络连通性
-- 记录配置过程中遇到的问题及解决方法
+确保 `/etc/autodl.sh` **保留已有任务**，包含以下两行即可：
 
-## 使用说明
+```bash
+echo "AutoDL startup hook executed at $(date '+%F %T')"
+/root/start_mihomo.sh
+```
 
-按照教程完成配置后，AutoDL 实例启动时会自动启动 Mihomo，并恢复已选节点。登录终端后，可检查 Mihomo 进程和代理连通性。
+首次创建 `/etc/autodl.sh` 时添加 `#!/bin/bash` 并设置 `chmod +x /etc/autodl.sh`。AutoDL 内部的 `/init/bin/customer.cmd.sh` 会调用 `bash /etc/autodl.sh`；不需要修改 `/init`、Supervisor 或 systemd。
 
-如果只想让当前终端暂时不走代理，可以取消该终端的代理环境变量；这不会停止 Mihomo 服务。具体命令和排查方式见完整教程。
+## 更新订阅并保持默认新加坡 03
 
-## 安全提醒
+该脚本不会在仓库或命令中写入订阅凭据，运行时交互输入真实的 Clash/Mihomo 订阅 URL；更新前会验证配置，成功后切换并验证当前节点。
 
-- 不要将包含真实订阅地址、token 或账号凭据的配置文件提交到公开仓库。
-- 分享配置前，检查文件中是否包含个人信息、订阅信息或其他敏感内容。
-- 代理服务能否访问特定网站，取决于订阅节点、网络环境和目标服务的访问策略。
+```bash
+# Python 依赖（仅安装一次）
+python3 -c 'import yaml' || python3 -m pip install pyyaml
 
-## 机场推荐
+# 在仓库目录执行
+bash scripts/update_subscription.sh
+```
 
-个人使用的机场： [FlyBit](https://flybit.vip/#/register?code=fAjapVQb)
+订阅可能更换策略组名称、节点名称或代理端口。如果不包含 `Flybit` 和 `🇸🇬 新加坡 | 03`，脚本会**中止且不覆盖当前配置**。
 
-请根据自己的需求选择服务，并妥善保管订阅链接。
+## 重启后验证
+
+```bash
+cat /tmp/autodl.sh.log
+pgrep -af mihomo
+curl --noproxy '*' -fsS http://127.0.0.1:9090/proxies/Flybit | python3 -c 'import json,sys;print(json.load(sys.stdin)["now"])'
+curl -sS -o /dev/null -w 'GitHub HTTP=%{http_code}\n' https://github.com
+```
+
+此次实测的开机日志为 `AutoDL startup hook executed at 2026-10-18 23:36:17`；Mihomo 作为 PID 18 运行，并使用新加坡 03。
+
+> 注意：该验证适用于**同一实例停止再启动**。容器重建、更换镜像或更新程序覆盖 `config.yaml` 时，需要重新检查配置。脚本启动后不提供崩溃自动拉起功能。
+
+## 安全
+
+**不要上传**真实订阅链接、凭据、`/etc/mihomo/config.yaml`、Mihomo 日志或缓存到公开仓库；尤其不要把订阅 token 写到脚本或 README。控制 API 仅监听 localhost。代理连接成功不代表 ChatGPT 一定可用：Cloudflare 403 与 OpenAI API 的 401 是不同问题。
+
+完整步骤、诊断与故障处理：[autodl_mihomo_setup.md](autodl_mihomo_setup.md)。
