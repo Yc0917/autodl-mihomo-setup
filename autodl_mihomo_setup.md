@@ -1,955 +1,44 @@
-# AutoDL 上部署 Mihomo：服务器独立代理、节点持久化与开机自动启动
+# AutoDL Mihomo 完整配置与维护（2026-10-18 更新）
 
-本文记录在 **AutoDL Ubuntu 22.04 容器实例**中部署 Mihomo 的完整过程。目标是：
+本文针对 **AutoDL Linux 容器**，记录 Mihomo 安装、更新订阅、默认节点选择及经重启验证的开机自启动方案。旧版本曾使用 `FlyBit` / 新加坡 13 / `store-selected: true` / `/etc/profile.d` 钩子；当前实测已更改，不要混用。
 
-- 不再依赖本地电脑长期运行 Clash；
-- 不再依赖 `ssh -R` 反向隧道；
-- Mihomo 在 AutoDL 实例启动后自动运行；
-- 终端中的 `curl`、`wget`、`git`、`pip` 等命令自动使用代理；
-- Mihomo 重启后恢复上一次手动选择的节点；
-- 保留故障排查方法，便于后续重装或迁移。
-
-> 本文命令基于一次实际配置过程整理。测试环境与订阅服务变化后，版本号、节点名称、订阅格式可能需要相应调整。
-
----
-
-## 1. 最终架构
-
-最终不再使用：
+## 1. 当前环境和架构
 
 ```text
-AutoDL
-  ↓
-SSH reverse tunnel
-  ↓
-本地电脑 Clash
-  ↓
-Internet
+AutoDL 容器启动
+  └─ 平台启动入口 /init/bin/customer.cmd.sh
+      └─ bash /etc/autodl.sh
+          └─ /root/start_mihomo.sh
+              └─ /usr/local/bin/mihomo -d /etc/mihomo
+                  └─ Flybit → 🇸🇬 新加坡 | 03
 ```
 
-而是：
+实际确认的配置：
+- `mixed-port: 7890`，`mode: rule`，`external-controller: 127.0.0.1:9090`；
+- Mihomo `v1.19.32`；策略组名称精确为 `Flybit`（大小写敏感）；
+- `default-selected: "🇸🇬 新加坡 | 03"`，`profile.store-selected: false`；
+- 平台 PID 1 是 `bash /init/boot/boot.sh`，不是 systemd；虽然有 supervisord 进程，但它的 `/init/supervisor/supervisor.ini` 在运行时不可访问，故不直接改动；
+- `/init/bin/customer.cmd.sh` 中调用 `bash /etc/autodl.sh >> /tmp/autodl.sh.log 2>&1`。
 
-```text
-AutoDL
-  ↓
-127.0.0.1:7890
-  ↓
-Mihomo
-  ↓
-机场订阅节点
-  ↓
-Internet
-```
+同一 AutoDL 实例停止、重新启动后，观察到 `/tmp/autodl.sh.log` 中记录 `2026-10-18 23:36:17`、Mihomo PID 18，且控制 API 显示新加坡 03。**这能验证当前实例重启后的工作流程，但不保证镜像重建或订阅覆盖后仍保持。**
 
-本次实际使用的节点为：
+## 2. 初次安装 Mihomo
 
-```text
-🇸🇬 新加坡 | 13 | 直连 *0.3
-```
-
-实测从 GitHub 下载约 21.7 MB 文件时：
-
-```text
-speed ≈ 2.62 MB/s
-time  ≈ 8.7 s
-```
-
-相比服务器裸连 GitHub 时只有十几到几十 KB/s，速度明显提升。
-
----
-
-## 2. 测试环境
-
-服务器环境：
-
-```text
-Architecture : x86_64
-OS           : Ubuntu 22.04.5 LTS
-User         : root
-Environment  : AutoDL container
-```
-
-检查命令：
-
-```bash
-uname -m
-cat /etc/os-release | head -n 6
-whoami
-```
-
-本次安装的 Mihomo：
-
-```text
-Mihomo Meta v1.19.32
-linux amd64
-```
-
-> 后续重新部署时可以使用新的稳定版本，不要求必须使用 v1.19.32。
-
----
-
-# 3. 安装 Mihomo
-
-## 3.1 清理旧代理环境变量
-
-如果之前使用过 SSH 反向代理，例如服务器代理指向：
-
-```text
-127.0.0.1:27890
-```
-
-先检查：
-
-```bash
-env | grep -i proxy
-```
-
-清理旧变量：
-
-```bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
-```
-
-再次确认：
-
-```bash
-env | grep -i proxy
-```
-
-`NO_PROXY` / `no_proxy` 可以保留。
-
----
-
-## 3.2 下载 Mihomo
-
-进入临时目录：
+机器架构先查 `uname -m`，以下为 x86_64 示例。Mihomo 发行版本及下载地址请以 [MetaCubeX/mihomo Releases](https://github.com/MetaCubeX/mihomo/releases) 为准：
 
 ```bash
 cd /tmp
-```
-
-本次使用：
-
-```bash
-wget -O mihomo.gz \
-https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-v1.19.32.gz
-```
-
-如果服务器直连 GitHub 很慢，可以临时恢复本地 Clash + SSH 反向隧道，只用于完成初始安装。
-
-例如服务器侧临时代理端口为 `27890`：
-
-```bash
-export http_proxy=http://127.0.0.1:27890
-export https_proxy=http://127.0.0.1:27890
-```
-
-下载完成后：
-
-```bash
+curl -fL --retry 3 -o mihomo.gz \
+  https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-v1.19.32.gz
 gunzip -f mihomo.gz
 install -m 755 mihomo /usr/local/bin/mihomo
+/usr/local/bin/mihomo -v
+install -d -m 700 /etc/mihomo
 ```
 
-验证：
+首次安装要在机场后台获取正确的 **Clash / Mihomo YAML 订阅链接**，不要把 Dashboard URL 当作订阅。首次下载也建议借助下面的订阅更新脚本，而不是直接把未经校验的内容覆盖到运行配置里。
 
-```bash
-mihomo -v
-```
-
-示例：
-
-```text
-Mihomo Meta v1.19.32 linux amd64
-```
-
----
-
-# 4. 配置订阅
-
-创建配置目录：
-
-```bash
-mkdir -p /etc/mihomo
-```
-
-## 4.1 获取正确的订阅 URL
-
-不要把机场的 Dashboard 页面地址当作订阅地址。
-
-错误示例：
-
-```text
-https://example.com/#/dashboard
-```
-
-需要在机场后台获取真正的 **Clash / Clash Meta / Mihomo 订阅链接**，通常形如：
-
-```text
-https://example.com/api/v1/client/subscribe?token=...
-```
-
-订阅 URL 中通常含有账户 token，**不要提交到 GitHub，也不要公开分享**。
-
-为避免订阅地址直接进入 shell history，可以：
-
-```bash
-read -s -p "Subscription URL: " SUB_URL; echo
-```
-
-粘贴真实订阅地址后下载：
-
-```bash
-curl -fL -A "clash.meta" "$SUB_URL" \
-  -o /etc/mihomo/config.yaml \
-  -w '\nHTTP=%{http_code} TYPE=%{content_type} SIZE=%{size_download}\n'
-```
-
-检查：
-
-```bash
-ls -lh /etc/mihomo/config.yaml
-```
-
-正常配置通常至少有几 KB，不应只有十几或几十字节。
-
----
-
-# 5. 下载 Country.mmdb
-
-第一次校验配置时，如果出现：
-
-```text
-Can't find MMDB, start download
-Can't initialize GEOIP: can't download MMDB: context deadline exceeded
-```
-
-可手动下载：
-
-```bash
-cd /etc/mihomo
-curl -fL --retry 3 \
-  https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/country.mmdb \
-  -o Country.mmdb
-```
-
-检查：
-
-```bash
-ls -lh /etc/mihomo/Country.mmdb
-```
-
-本次实际下载约：
-
-```text
-7.4M
-```
-
----
-
-# 6. 校验 Mihomo 配置
-
-执行：
-
-```bash
-mihomo -t -d /etc/mihomo
-```
-
-成功时：
-
-```text
-configuration file /etc/mihomo/config.yaml test is successful
-```
-
-只有配置校验成功后再正式启动。
-
----
-
-# 7. 启动 Mihomo
-
-后台启动：
-
-```bash
-nohup mihomo -d /etc/mihomo > /tmp/mihomo.log 2>&1 &
-```
-
-检查进程：
-
-```bash
-pgrep -af mihomo
-```
-
-检查日志：
-
-```bash
-tail -n 50 /tmp/mihomo.log
-```
-
-本次订阅配置中：
-
-```text
-mixed-port: 7890
-external-controller: 127.0.0.1:9090
-```
-
-因此：
-
-- `127.0.0.1:7890`：HTTP / SOCKS mixed proxy；
-- `127.0.0.1:9090`：Mihomo REST API。
-
-建议不要把 `7890` 或 `9090` 映射到公网。
-
----
-
-# 8. 查看并选择代理节点
-
-## 8.1 查看策略组
-
-执行：
-
-```bash
-curl -s http://127.0.0.1:9090/proxies | \
-python3 -c 'import sys,json; p=json.load(sys.stdin)["proxies"]; [print(k, "|", v.get("type"), "| 当前:", v.get("now","")) for k,v in p.items() if v.get("type") in {"Selector","URLTest","Fallback","LoadBalance"}]'
-```
-
-本次主策略组为：
-
-```text
-FlyBit
-```
-
-## 8.2 列出 FlyBit 可选节点
-
-```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; d=json.load(sys.stdin); print("当前:",d.get("now")); print("\n可选节点:"); [print(i,x) for i,x in enumerate(d.get("all",[]),1)]'
-```
-
-订阅中可能混入并非真实节点的提示项，例如：
-
-```text
-剩余：xxx GB，到期：长期有效
-邀请返佣...
-有问题重新从网站获取订阅
-请关注网站首页的公告信息
-```
-
-不要选择这些信息项。
-
-## 8.3 选择新加坡节点
-
-本次实测使用：
-
-```text
-🇸🇬 新加坡 | 13 | 直连 *0.3
-```
-
-切换：
-
-```bash
-curl -X PUT http://127.0.0.1:9090/proxies/FlyBit \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"🇸🇬 新加坡 | 13 | 直连 *0.3"}'
-```
-
-检查：
-
-```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; print("当前节点:",json.load(sys.stdin)["now"])'
-```
-
----
-
-# 9. 保存节点选择
-
-如果希望 Mihomo 重启后继续使用上次手工选择的节点，需要：
-
-```yaml
-profile:
-  store-selected: true
-```
-
-先检查是否已存在：
-
-```bash
-grep -A 3 '^profile:' /etc/mihomo/config.yaml
-```
-
-如果没有，可以先备份：
-
-```bash
-cp /etc/mihomo/config.yaml /etc/mihomo/config.yaml.bak
-```
-
-然后追加：
-
-```bash
-printf '\nprofile:\n  store-selected: true\n' >> /etc/mihomo/config.yaml
-```
-
-再次校验：
-
-```bash
-mihomo -t -d /etc/mihomo
-```
-
-> 如果配置文件本身已经有 `profile:`，不要追加第二个同名 YAML key，应修改已有的 `profile` 节点。
-
-重新启动 Mihomo 后，检查节点是否仍为新加坡节点：
-
-```bash
-pkill -x mihomo
-/root/start_mihomo.sh
-```
-
-```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; print("重启后节点:",json.load(sys.stdin)["now"])'
-```
-
----
-
-# 10. 配置终端自动使用代理
-
-Mihomo 启动本身并不会强制所有应用自动走代理。
-
-对于 `curl`、`wget`、`git`、`pip` 等常见命令，可以通过 shell 环境变量使用 Mihomo。
-
-在 `/root/.bashrc` 中加入：
-
-```bash
-# Mihomo proxy
-export http_proxy=http://127.0.0.1:7890
-export https_proxy=http://127.0.0.1:7890
-export all_proxy=socks5://127.0.0.1:7890
-
-export HTTP_PROXY=http://127.0.0.1:7890
-export HTTPS_PROXY=http://127.0.0.1:7890
-export ALL_PROXY=socks5://127.0.0.1:7890
-
-export NO_PROXY=127.0.0.1,localhost
-export no_proxy=127.0.0.1,localhost
-```
-
-立即加载：
-
-```bash
-source /root/.bashrc
-```
-
-检查：
-
-```bash
-env | grep -i proxy
-```
-
-测试时不再手工指定 `-x`：
-
-```bash
-curl --max-time 15 https://api.ipify.org
-echo
-```
-
-能够直接返回代理出口公网 IP，说明当前 shell 已自动使用 Mihomo。
-
----
-
-# 11. 创建 Mihomo 启动脚本
-
-创建：
-
-```bash
-cat > /root/start_mihomo.sh <<'EOF'
-#!/bin/bash
-if ! pgrep -x mihomo >/dev/null; then
-    nohup /usr/local/bin/mihomo -d /etc/mihomo >/tmp/mihomo.log 2>&1 &
-fi
-EOF
-```
-
-添加执行权限：
-
-```bash
-chmod +x /root/start_mihomo.sh
-```
-
-这个脚本具有幂等性：
-
-- Mihomo 已运行时，不重复启动；
-- Mihomo 未运行时，后台启动。
-
-手动测试：
-
-```bash
-/root/start_mihomo.sh
-pgrep -af mihomo
-```
-
----
-
-# 12. AutoDL 实例开机自动启动 Mihomo
-
-这是本次配置中比较特殊的一部分。
-
-## 12.1 确认 AutoDL PID 1
-
-检查：
-
-```bash
-ps -p 1 -o pid,comm,args
-```
-
-本次实例显示：
-
-```text
-PID  COMMAND
-1    bash    bash /init/boot/boot.sh
-```
-
-因此该 AutoDL 容器不是标准 systemd 主机。
-
-不要直接依赖：
-
-```bash
-systemctl enable mihomo
-```
-
----
-
-## 12.2 检查 AutoDL 启动流程
-
-AutoDL 的 `/init/boot/boot.sh` 在实例启动后会被删除，但 PID 1 的 bash 仍持有该脚本文件描述符。
-
-检查：
-
-```bash
-ls -l /proc/1/fd | tail -n 20
-```
-
-本次可见：
-
-```text
-255 -> /init/boot/boot.sh (deleted)
-```
-
-读取脚本中的关键启动逻辑：
-
-```bash
-cat /proc/1/fd/255 | \
-grep -nE 'rc.local|bashrc|profile|startup|start|supervisor|/root|source|run-parts'
-```
-
-实际发现：
-
-```text
-source /etc/profile
-```
-
-而且发生在 AutoDL 后续启动 Supervisor 之前。
-
-因此可以利用 `/etc/profile.d/` 作为实例启动钩子。
-
----
-
-## 12.3 创建 AutoDL 开机启动钩子
-
-创建：
-
-```bash
-cat > /etc/profile.d/00-mihomo-start.sh <<'EOF'
-#!/bin/bash
-
-if [ -x /root/start_mihomo.sh ]; then
-    /root/start_mihomo.sh
-fi
-EOF
-```
-
-添加权限：
-
-```bash
-chmod +x /etc/profile.d/00-mihomo-start.sh
-```
-
-最终启动链路：
-
-```text
-AutoDL instance boot
-        ↓
-/init/boot/boot.sh
-        ↓
-source /etc/profile
-        ↓
-/etc/profile.d/00-mihomo-start.sh
-        ↓
-/root/start_mihomo.sh
-        ↓
-Mihomo starts automatically
-```
-
-这不是“打开终端后才启动”，而是在当前这套 AutoDL 镜像的实例启动流程中自动运行。
-
-> 注意：这是根据本次实际 AutoDL 容器的 `boot.sh` 行为确认的。如果以后换了镜像、AutoDL 修改了启动流程，建议重新检查 `ps -p 1` 和启动脚本。
-
----
-
-# 13. 为什么代理变量不放到 `/etc/profile.d/00-mihomo-start.sh`
-
-AutoDL 启动流程是：
-
-```text
-source /etc/profile
-↓
-继续启动 AutoDL 自身系统服务
-```
-
-如果在这个阶段直接全局：
-
-```bash
-export http_proxy=...
-export https_proxy=...
-```
-
-后续 AutoDL 自身服务可能继承这些代理环境变量。
-
-因此本次采用分层：
-
-### 开机层
-
-`/etc/profile.d/00-mihomo-start.sh`
-
-只负责：
-
-```text
-启动 Mihomo
-```
-
-### 用户 shell 层
-
-`/root/.bashrc`
-
-负责：
-
-```text
-http_proxy
-https_proxy
-all_proxy
-```
-
-这样 AutoDL 系统服务不需要强制走代理，而用户终端可以自动走 Mihomo。
-
----
-
-# 14. 开机自动启动验证
-
-关闭 AutoDL 实例，然后重新启动。
-
-进入实例后：
-
-```bash
-pgrep -af mihomo
-```
-
-本次重新开机后实际观察到：
-
-```text
-13 /usr/local/bin/mihomo -d /etc/mihomo
-```
-
-PID 很小，说明 Mihomo 在实例启动的早期阶段已经运行。
-
-检查节点：
-
-```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; print("当前节点:",json.load(sys.stdin)["now"])'
-```
-
-结果：
-
-```text
-当前节点: 🇸🇬 新加坡 | 13 | 直连 *0.3
-```
-
-检查代理变量：
-
-```bash
-env | grep -i proxy
-```
-
-检查实际联网：
-
-```bash
-curl --max-time 15 https://api.ipify.org
-echo
-```
-
-能够正常返回代理公网出口 IP，说明整套自动化生效。
-
----
-
-# 15. 日常使用
-
-正常情况下，实例启动后不需要手工运行：
-
-```bash
-mihomo -d /etc/mihomo
-```
-
-也不需要重复：
-
-```bash
-export http_proxy=...
-export https_proxy=...
-```
-
-更不需要再建立：
-
-```text
-ssh -R 27890 ...
-```
-
-常用检查：
-
-```bash
-pgrep -af mihomo
-```
-
-```bash
-tail -n 50 /tmp/mihomo.log
-```
-
-```bash
-curl --max-time 15 https://api.ipify.org
-echo
-```
-
-查看当前节点：
-
-```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; print(json.load(sys.stdin)["now"])'
-```
-
----
-
-# 16. 临时关闭当前终端代理
-
-只关闭当前 shell 的代理环境变量：
-
-```bash
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-```
-
-这不会停止 Mihomo。
-
-重新开启当前终端代理：
-
-```bash
-source /root/.bashrc
-```
-
-如果要停止 Mihomo：
-
-```bash
-pkill -x mihomo
-```
-
-重新启动：
-
-```bash
-/root/start_mihomo.sh
-```
-
----
-
-# 17. 订阅更新注意事项
-
-本次 `config.yaml` 是通过订阅直接下载的：
-
-```text
-/etc/mihomo/config.yaml
-```
-
-后续如果重新执行：
-
-```bash
-curl ... -o /etc/mihomo/config.yaml
-```
-
-会覆盖本地修改。
-
-因此本地手工加入的：
-
-```yaml
-profile:
-  store-selected: true
-```
-
-可能被新的订阅配置覆盖。
-
-更新订阅后至少应重新检查：
-
-```bash
-grep -A 3 '^profile:' /etc/mihomo/config.yaml
-mihomo -t -d /etc/mihomo
-```
-
-同时再次确认：
-
-```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; print(json.load(sys.stdin)["now"])'
-```
-
----
-
-# 18. 安全注意事项
-
-1. **不要把订阅 URL 或 token 提交到 GitHub。**
-2. 不要把机场账户信息写入公开仓库。
-3. `9090` REST API 建议只监听 localhost。
-4. `7890` 不需要通过 AutoDL 端口映射暴露到公网。
-5. 如果订阅配置启用了 LAN 访问，应确认这符合自己的安全需求。
-6. 上传配置文件到 GitHub 前，应先搜索敏感字段：
-
-```bash
-grep -nEi 'token|password|uuid|secret|server:' /etc/mihomo/config.yaml
-```
-
-正常情况下，**不要上传 `/etc/mihomo/config.yaml` 本身**。
-
----
-
-# 遇到的问题与解决方法
-
-## 1. `wget` 一直连接 `127.0.0.1:27890` 并提示 `Connection refused`
-
-### 现象
-
-下载 Mihomo 时：
-
-```text
-Connecting to 127.0.0.1:27890... failed: Connection refused.
-```
-
-### 原因
-
-服务器仍然保留以前 SSH 反向代理使用的：
-
-```bash
-http_proxy=http://127.0.0.1:27890
-https_proxy=http://127.0.0.1:27890
-```
-
-但本地 SSH 隧道已经关闭，因此端口没有服务。
-
-### 解决
-
-```bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
-```
-
-再：
-
-```bash
-env | grep -i proxy
-```
-
-确认旧代理变量已经清除。
-
----
-
-## 2. AutoDL 直接从 GitHub 下载 Mihomo 很慢
-
-### 现象
-
-GitHub 约：
-
-```text
-33 KB/s
-```
-
-SourceForge 镜像甚至只有：
-
-```text
-15.5 KB/s
-```
-
-### 原因
-
-主要是当前 AutoDL 实例到海外站点的网络链路慢，不是 Mihomo 文件本身的问题。
-
-### 解决
-
-初始安装阶段临时使用原来的：
-
-```text
-AutoDL
-↓
-127.0.0.1:27890
-↓
-SSH reverse tunnel
-↓
-本地 Clash
-```
-
-把 Mihomo 下载并配置完成。
-
-之后服务器改为自己的 Mihomo，不再依赖本地隧道。
-
----
-
-## 3. 订阅配置只有 21 字节，Mihomo 报 YAML 错误
-
-### 现象
-
-```text
-100    21
-```
-
-随后：
-
-```text
-yaml: unmarshal errors:
-line 1: cannot unmarshal !!str ... into config.RawConfig
-```
-
-### 原因
-
-最初使用的不是实际 Clash/Mihomo 订阅 URL，而是机场 Dashboard 页面或返回普通错误文本的地址。
-
-### 解决
-
-从机场后台获取真正的 Clash / Mihomo 订阅链接，并使用：
-
-```bash
-curl -fL -A "clash.meta" "$SUB_URL" \
-  -o /etc/mihomo/config.yaml \
-  -w '\nHTTP=%{http_code} TYPE=%{content_type} SIZE=%{size_download}\n'
-```
-
-通过 `SIZE` 快速判断是否拿到了正常配置。
-
----
-
-## 4. Mihomo 配置测试时自动下载 MMDB 超时
-
-### 现象
-
-```text
-Can't find MMDB, start download
-Can't initialize GEOIP: can't download MMDB: context deadline exceeded
-```
-
-### 原因
-
-Mihomo 需要 GeoIP 数据库，但服务器当时无法及时自动下载。
-
-### 解决
-
-手工下载：
+出现 GEOIP MMDB 下载超时时，可按需下载：
 
 ```bash
 curl -fL --retry 3 \
@@ -957,358 +46,150 @@ curl -fL --retry 3 \
   -o /etc/mihomo/Country.mmdb
 ```
 
-之后：
+验证：`mihomo -t -d /etc/mihomo`。
+
+## 3. 更新订阅：保留默认节点并防止坏配置覆盖
+
+**不要在仓库写入真实订阅 URL 或 token。** 本仓库脚本 `scripts/update_subscription.sh` 会：
+
+1. 交互读取订阅 URL（不回显、不保存到仓库）；
+2. 下载到 `/etc/mihomo` 下的临时文件；curl 错误则停止；
+3. 通过 PyYAML 解析 YAML，检查 `Flybit` 是 `select`、包含 `🇸🇬 新加坡 | 03`；
+4. 设定 `default-selected` 与 `profile.store-selected: false`；
+5. 通过 `mihomo -t` 校验后，以原子替换写入 `/etc/mihomo/config.yaml`；
+6. 若 Mihomo 已在运行，则重启进程、核查控制 API 和当前选择。
 
 ```bash
-mihomo -t -d /etc/mihomo
+python3 -c 'import yaml' || python3 -m pip install pyyaml
+bash scripts/update_subscription.sh
 ```
 
-配置校验成功。
+> 注意：PyYAML 会规范化 YAML 的文本格式，但目标是保留普通 Clash/Mihomo YAML 的**配置语义**；如果机场使用特殊 YAML 标签或依赖非标准内容，应先单独审查。发生下载、解析、节点检查或配置验证失败时，脚本不会覆盖原配置。运行中更换配置会短暂中断当前代理连接，建议避开训练下载任务。
 
----
+订阅生成的文件中可能含有服务器地址和认证密钥，**不得将 `config.yaml` 提交公开 GitHub**。若脚本已成功更新但节点状态不符，优先查看 `/tmp/mihomo.log` 与策略组信息。
 
-## 5. FlyBit 默认选中了“剩余流量”而不是真实节点
+## 4. 手动切换及固定默认节点
 
-### 现象
-
-查询：
-
-```text
-FlyBit | Selector | 当前: 剩余：104.69 GB，到期：长期有效
-```
-
-### 原因
-
-机场把套餐流量、公告等信息作为“伪节点”放进订阅列表。
-
-### 解决
-
-先列出所有节点：
+查询全部 Selector 组：
 
 ```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; d=json.load(sys.stdin); [print(i,x) for i,x in enumerate(d.get("all",[]),1)]'
+curl --noproxy '*' -fsS http://127.0.0.1:9090/proxies | python3 -c '
+import json,sys
+for name,p in json.load(sys.stdin)["proxies"].items():
+    if p.get("type") == "Selector":
+        print(name,"当前:",p.get("now"))
+'
 ```
 
-然后手工选择真实节点：
+临时切换当前节点：
 
 ```bash
-curl -X PUT http://127.0.0.1:9090/proxies/FlyBit \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"🇸🇬 新加坡 | 13 | 直连 *0.3"}'
+curl --noproxy '*' -fsS -X PUT -H 'Content-Type: application/json' \
+  -d '{"name":"🇸🇬 新加坡 | 03"}' \
+  http://127.0.0.1:9090/proxies/Flybit
 ```
 
----
-
-## 6. 需要确认服务器是否真的脱离 Mac SSH 隧道
-
-### 处理方式
-
-在启动 Mihomo 前先清除：
-
-```bash
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY all_proxy ALL_PROXY
-```
-
-Mihomo 独立启动后：
-
-```bash
-curl -x http://127.0.0.1:7890 \
-  --max-time 15 https://api.ipify.org
-```
-
-确认成功后关闭 Mac 上的 `ssh -R`。
-
-再重复测试，如果依然成功，就确认：
-
-```text
-AutoDL → Mihomo → subscription node → Internet
-```
-
-已经不再经过本地电脑。
-
----
-
-## 7. 手工选择节点后，担心重启恢复默认节点
-
-### 解决
-
-在 Mihomo 配置中加入：
+**临时切换不等于重启后的默认选择。** 对当前机场的 YAML 行内策略组：
 
 ```yaml
+proxy-groups:
+  - {name: 'Flybit', type: select, default-selected: "🇸🇬 新加坡 | 03", proxies: ["🇸🇬 新加坡 | 03"]}
 profile:
-  store-selected: true
+  store-selected: false
 ```
 
-再手工选择节点，并重启验证。
+上面 `proxies` 只是精简示例，**不要拿它覆盖真实订阅的 73 个节点或其他规则**。推荐使用更新脚本按 YAML 结构调整相应字段。关闭 `store-selected` 是为了避免之前手动切换的节点在下一次启动时覆盖默认选择。
 
-最终重启后仍恢复：
+如果订阅更改了组名或节点名，需要相应修改脚本中的 `GROUP` / `NODE` 参数，不能假设订阅永远不变。
 
-```text
-🇸🇬 新加坡 | 13 | 直连 *0.3
-```
+## 5. AutoDL 容器级开机自启动（已实测）
 
----
-
-## 8. `systemctl` 存在，但 AutoDL 并不是 systemd 主机
-
-### 现象
-
-虽然：
+创建/安装启动脚本：
 
 ```bash
-command -v systemctl
+install -m 755 scripts/start_mihomo.sh /root/start_mihomo.sh
 ```
 
-能看到：
+该脚本先检查已运行进程，再测试 Mihomo 配置，使用 `nohup` 在后台启动，并记录 `/tmp/mihomo.log`。它是**单次拉起脚本，不是持续进程守护器**。
 
-```text
-/usr/bin/systemctl
-```
-
-但：
+在当前 AutoDL 镜像中，`/init/bin/customer.cmd.sh` 含有：
 
 ```bash
-ps -p 1 -o pid,comm,args
+echo "### /etc/autodl.sh run log file ###" > /tmp/autodl.sh.log
+bash /etc/autodl.sh >> /tmp/autodl.sh.log 2>&1
 ```
 
-显示：
-
-```text
-1 bash bash /init/boot/boot.sh
-```
-
-### 原因
-
-容器 PID 1 是 AutoDL 自己的启动脚本，不是 `systemd`。
-
-### 结论
-
-不能因为 `systemctl` 命令存在，就直接按普通 Ubuntu 主机方式配置：
+如果 `/etc/autodl.sh` 不存在，可创建：
 
 ```bash
-systemctl enable mihomo
-```
-
----
-
-## 9. AutoDL 有 Supervisor，但无法直接用 `supervisorctl`
-
-### 现象
-
-发现：
-
-```text
-/bin/supervisord -c /init/supervisor/supervisor.ini
-```
-
-但：
-
-```bash
-supervisorctl status
-```
-
-返回：
-
-```text
-http://localhost:9001 refused connection
-```
-
-进一步指定配置：
-
-```bash
-supervisorctl -c /init/supervisor/supervisor.ini status
-```
-
-却提示配置文件不存在。
-
-### 排查
-
-检查 mount namespace：
-
-```bash
-readlink /proc/$$/ns/mnt
-readlink /proc/<supervisord-pid>/ns/mnt
-```
-
-二者相同。
-
-但：
-
-```text
-/init/supervisor/supervisor.ini
-```
-
-确实已经不存在。
-
-### 原因
-
-AutoDL 启动期间生成并加载 Supervisor 配置，之后清理了临时启动目录。Supervisor 已经把配置读入内存，所以进程仍可运行。
-
-### 解决
-
-不修改 AutoDL 内部 Supervisor 配置，转而寻找官方启动流程中的持久化钩子。
-
----
-
-## 10. `/init/boot/boot.sh` 已删除，如何确认 AutoDL 开机逻辑
-
-### 现象
-
-PID 1 显示：
-
-```text
-bash /init/boot/boot.sh
-```
-
-但：
-
-```bash
-bash /init/boot/boot.sh
-```
-
-提示文件不存在。
-
-### 解决
-
-查看 PID 1 打开的文件描述符：
-
-```bash
-ls -l /proc/1/fd
-```
-
-发现：
-
-```text
-255 -> /init/boot/boot.sh (deleted)
-```
-
-因此仍可读取：
-
-```bash
-cat /proc/1/fd/255
-```
-
-并从中确认 AutoDL 启动阶段执行：
-
-```bash
-source /etc/profile
-```
-
-最终据此选择：
-
-```text
-/etc/profile.d/00-mihomo-start.sh
-```
-
-作为开机启动入口。
-
----
-
-## 11. `/tmp/mihomo_start.log` 不存在
-
-### 现象
-
-```bash
-cat /tmp/mihomo_start.log
-```
-
-返回：
-
-```text
-No such file or directory
-```
-
-### 原因
-
-实际使用的 `/root/start_mihomo.sh` 是：
-
-```bash
+cat > /etc/autodl.sh <<'EOF'
 #!/bin/bash
-if ! pgrep -x mihomo >/dev/null; then
-    nohup /usr/local/bin/mihomo -d /etc/mihomo >/tmp/mihomo.log 2>&1 &
-fi
+echo "AutoDL startup hook executed at $(date '+%F %T')"
+/root/start_mihomo.sh
+EOF
+chmod +x /etc/autodl.sh
 ```
 
-脚本只写：
+**如果已有 `/etc/autodl.sh`，不能直接覆盖**，只将日志和 `/root/start_mihomo.sh` 加入原文件，并保留其他任务。不要修改由平台管理的 `/init` 文件，也不要依赖 `systemctl enable`。旧版 `/etc/profile.d/00-mihomo-start.sh` 是历史方案；迁移后建议检查并移除旧的重复开机钩子。
 
-```text
-/tmp/mihomo.log
-```
+当前 `/root/.bashrc` 里曾有 `/root/start_mihomo.sh`，可作为临时兜底；真正验证成功后可以去掉这一行，保留 shell 代理环境变量，避免其掩盖容器级自启动失效。
 
-并没有创建 `mihomo_start.log`。
+## 6. 终端代理环境变量
 
-### 解决
-
-查看：
+只为交互 shell 配置，不要全局强制 AutoDL 平台服务经代理：
 
 ```bash
-tail -n 50 /tmp/mihomo.log
+# 加入 /root/.bashrc，避免重复添加
+export http_proxy=http://127.0.0.1:7890
+export https_proxy=http://127.0.0.1:7890
+export all_proxy=socks5://127.0.0.1:7890
+export HTTP_PROXY=http://127.0.0.1:7890
+export HTTPS_PROXY=http://127.0.0.1:7890
+export ALL_PROXY=socks5://127.0.0.1:7890
+export NO_PROXY=127.0.0.1,localhost
+export no_proxy=127.0.0.1,localhost
 ```
 
-即可。
+修改后在新终端确认 `env | grep -i proxy`。如果当前 shell 临时禁用代理，可 `unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY`，并不会停止 Mihomo。
 
----
-
-# 19. 最终状态检查清单
-
-实例重启后：
+## 7. 启动验证与排查
 
 ```bash
+bash -n /etc/autodl.sh
+bash -n /root/start_mihomo.sh
+bash /etc/autodl.sh
 pgrep -af mihomo
+curl --noproxy '*' -fsS http://127.0.0.1:9090/version
+curl --noproxy '*' -fsS http://127.0.0.1:9090/proxies/Flybit |
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["now"])'
+curl -sS -L --max-time 15 -o /dev/null -w 'GitHub HTTP=%{http_code}\n' https://github.com
 ```
 
-应看到：
-
-```text
-/usr/local/bin/mihomo -d /etc/mihomo
-```
-
-当前节点：
+停机、重启**同一 AutoDL 实例**之后检查：
 
 ```bash
-curl -s http://127.0.0.1:9090/proxies/FlyBit | \
-python3 -c 'import sys,json; print(json.load(sys.stdin)["now"])'
+cat /tmp/autodl.sh.log
+pgrep -af mihomo
+curl --noproxy '*' -fsS http://127.0.0.1:9090/proxies/Flybit |
+  python3 -c 'import json,sys;print(json.load(sys.stdin)["now"])'
 ```
 
-应为预期节点。
+当启动日志时间对应本次实例启动、进程已运行并且 API 返回新加坡 03，才能确认完整链路。仅打开终端后看到进程，可能是 `.bashrc` 的回退脚本启动的。
 
-代理变量：
+### 常见问题
 
-```bash
-env | grep -i proxy
-```
+- `ss: command not found`：极简容器没有 `ss`，可直接使用 API 检查，不必安装额外工具。
+- `/init/boot/boot.sh` / `/init/supervisor/supervisor.ini` 不存在：运行进程可能已经加载随后清理的临时文件；不要据此改写或重启平台 Supervisor。
+- `curl 403`：请求已到达 HTTP 服务但被拒绝；本次 `chatgpt.com` 的响应头含 `server: cloudflare`，`api.openai.com/v1/models` 未认证时返回 401；不表示整个网络断开。换节点后要分别检查目标网站连通性。
+- `curl 000` / TLS reset：还未得到有效 HTTP 响应，需分别检查直连、代理、DNS 和握手错误。
+- Mihomo API 返回 401：控制接口可能配置了 `secret`，请求需带 Bearer 认证。
+- `GLOBAL` 显示 DIRECT：在 `mode: rule` 下由分流规则决定出口，不能仅根据 GLOBAL 当前值认定所有流量直连。
+- 订阅更新导致固定节点消失：脚本将拒绝覆盖，先检查新订阅的组名/节点名，调整后再更新。
 
-应包含：
+## 8. 维护与安全边界
 
-```text
-http_proxy=http://127.0.0.1:7890
-https_proxy=http://127.0.0.1:7890
-all_proxy=socks5://127.0.0.1:7890
-```
-
-实际联网：
-
-```bash
-curl --max-time 15 https://api.ipify.org
-echo
-```
-
-GitHub 测速：
-
-```bash
-curl -x http://127.0.0.1:7890 -L -o /dev/null \
-  -w 'speed=%{speed_download} bytes/s time=%{time_total}s\n' \
-  https://github.com/MetaCubeX/mihomo/releases/download/v1.19.32/mihomo-linux-amd64-v1.19.32.gz
-```
-
-满足以上条件后，服务器已实现：
-
-```text
-AutoDL 开机
-→ Mihomo 自动启动
-→ 节点选择恢复
-→ shell 自动加载代理变量
-→ wget / curl / git / pip 可直接使用代理
-→ 不再依赖本地 Clash 和 SSH reverse tunnel
-```
+- 当前启动钩子已通过实际重启验证，但同一容器实例的持久性**不等于**重建实例或恢复镜像时文件仍保留。
+- 通过脚本更新订阅可以保留默认节点；使用外部命令直接覆盖 `config.yaml` 时会失去本地修改。
+- 不要把 `/etc/mihomo/config.yaml`、包含 token 的命令行、日志、订阅 URL 提交到 GitHub。
+- 控制器仅绑定 `127.0.0.1:9090`，不映射 `7890` / `9090` 到公网。
+- 机场测速节点的下载速度不代表 ChatGPT 一定可访问；需要分别测试服务可用性。
